@@ -1,4 +1,4 @@
-# Admir - Official Implementation
+# Admir
 
 This repository contains the official implementation for the paper: **AD-MIR: Bridging the Gap from Perception to Persuasion in Advertising Video Understanding via Structured Reasoning**.
 
