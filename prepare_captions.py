@@ -1,6 +1,6 @@
 """
 Caption Preparation Script
-Decodes videos, generates semantic captions via GPT-4o, and initializes the Admir database.
+Decodes videos, generates semantic captions via the configured VLM, and initializes the Admir database.
 """
 import functools
 import json
@@ -8,12 +8,16 @@ import multiprocessing as mp
 import os
 import base64
 import argparse
-import cv2
+try:
+    import cv2
+except ImportError:
+    cv2 = None
 import sys
 import inspect
 import requests
 import traceback
 import httpx
+import subprocess
 from typing import Dict, List, Tuple, Optional, Any
 from tqdm import tqdm
 from openai import OpenAI
@@ -21,18 +25,82 @@ from openai import OpenAI
 # Try importing admir config
 try:
     import admir.config as config
+    from admir.utils import create_chat_completion, robust_json_parse
 except ImportError:
     class Config:
+        STRICT_PAPER_MODE = False
         pass
     config = Config()
+    def create_chat_completion(client, model, messages, max_tokens=None, temperature=None, **kwargs):
+        params = dict(kwargs)
+        if max_tokens is not None:
+            params["max_tokens"] = max_tokens
+        if temperature is not None:
+            params["temperature"] = temperature
+        return client.chat.completions.create(model=model, messages=messages, **params)
+    def robust_json_parse(text):
+        return json.loads(text)
 
 # --------------------------------------------------------------------------- #
 #                             Global Configuration                            #
 # --------------------------------------------------------------------------- #
 
-GPT4O_BASE_URL = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
-GPT4O_API_KEY = os.environ.get("OPENAI_API_KEY", "")
-GPT4O_MODEL_NAME = "gpt-4o"
+GPT4O_BASE_URL = os.environ.get(
+    "OPENAI_BASE_URL",
+    getattr(config, "LOCAL_VLLM_BASE_URL", "https://api.openai.com/v1"),
+)
+GPT4O_API_KEY = os.environ.get("OPENAI_API_KEY", getattr(config, "OPENAI_API_KEY", "EMPTY"))
+GPT4O_MODEL_NAME = os.environ.get(
+    "ADMIR_CAPTION_VLM_MODEL",
+    getattr(config, "AOAI_CAPTION_VLM_MODEL_NAME", ""),
+)
+MAX_API_RETRIES = 8
+
+
+def _strict_mode() -> bool:
+    return bool(getattr(config, "STRICT_PAPER_MODE", False))
+
+
+def _validate_strict_ready() -> None:
+    validate = getattr(config, "validate_strict_paper_config", None)
+    if callable(validate):
+        validate(require_api_key=True)
+    if _strict_mode() and not GPT4O_MODEL_NAME:
+        raise RuntimeError("Set ADMIR_CAPTION_VLM_MODEL before running caption generation.")
+
+
+def _run_metadata(video_id: str = "", fps: float = 0.0, clip_secs: int = 0) -> Dict[str, Any]:
+    return {
+        "strict_paper_mode": _strict_mode(),
+        "caption_model": GPT4O_MODEL_NAME,
+        "openai_base_url": GPT4O_BASE_URL,
+        "embedding_backend": getattr(config, "EMBEDDING_BACKEND", ""),
+        "embedding_model": getattr(config, "AOAI_EMBEDDING_LARGE_MODEL_NAME", ""),
+        "embedding_dim": getattr(config, "AOAI_EMBEDDING_LARGE_DIM", None),
+        "video_id": video_id,
+        "fps": float(fps) if fps else None,
+        "clip_secs": int(clip_secs) if clip_secs else None,
+    }
+
+
+def _metadata_matches_current_run(metadata: Dict[str, Any], fps: float, clip_secs: int) -> bool:
+    if not isinstance(metadata, dict):
+        return False
+    return (
+        metadata.get("strict_paper_mode") == _strict_mode()
+        and metadata.get("caption_model") == GPT4O_MODEL_NAME
+        and metadata.get("embedding_backend") == getattr(config, "EMBEDDING_BACKEND", "")
+        and metadata.get("embedding_model") == getattr(config, "AOAI_EMBEDDING_LARGE_MODEL_NAME", "")
+        and int(metadata.get("embedding_dim") or 0) == int(getattr(config, "AOAI_EMBEDDING_LARGE_DIM", 0))
+        and abs(float(metadata.get("fps") or 0.0) - float(fps)) < 1e-9
+        and int(metadata.get("clip_secs") or 0) == int(clip_secs)
+    )
+
+
+def _strip_metadata(payload: Dict[str, Any]) -> Dict[str, Any]:
+    clean = dict(payload)
+    clean.pop("_admir_metadata", None)
+    return clean
 
 # --------------------------------------------------------------------------- #
 #                             Prompt templates                                #
@@ -71,7 +139,7 @@ REGISTRIES_PLACEHOLDER
 Return *only* the merged `subject_registry` JSON object.
 """
 
-SYSTEM_PROMPT = "You are a helpful assistant designed to output JSON."
+SYSTEM_PROMPT = "You are a helpful assistant designed to output strict JSON only. Do not wrap JSON in markdown."
 
 # --------------------------------------------------------------------------- #
 #                      Database Builder Integration                           #
@@ -137,6 +205,22 @@ def decode_video_to_frames(video_path: str, output_folder: str, fps: float = 1.0
         return
 
     os.makedirs(output_folder, exist_ok=True)
+    if cv2 is None:
+        temp_pattern = os.path.join(output_folder, "frame_tmp_%06d.jpg")
+        cmd = [
+            "ffmpeg", "-y", "-i", video_path,
+            "-vf", f"fps={fps}",
+            "-q:v", "2",
+            temp_pattern,
+        ]
+        print(f"Decoding video {os.path.basename(video_path)} with ffmpeg at {fps} FPS...")
+        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        temp_files = sorted(f for f in os.listdir(output_folder) if f.startswith("frame_tmp_") and f.endswith(".jpg"))
+        for idx, name in enumerate(temp_files):
+            os.rename(os.path.join(output_folder, name), os.path.join(output_folder, f"frame_n{idx:06d}.jpg"))
+        print(f"Decoded {len(temp_files)} frames.")
+        return
+
     cap = cv2.VideoCapture(video_path)
     
     if not cap.isOpened():
@@ -238,6 +322,7 @@ def _get_openai_client():
     """
     Configures the OpenAI client with http_client for robust connections.
     """
+    _validate_strict_ready()
     return OpenAI(
         base_url=GPT4O_BASE_URL,
         api_key=GPT4O_API_KEY,
@@ -256,7 +341,9 @@ def _caption_clip(task: Tuple[str, Dict], caption_ckpt_folder) -> Tuple[str, dic
     if os.path.exists(ckpt_path):
         try:
             with open(ckpt_path, "r") as f:
-                return timestamp, json.load(f)
+                cached = json.load(f)
+            if not _strict_mode() or cached.get("_admir_metadata", {}).get("caption_model") == GPT4O_MODEL_NAME:
+                return timestamp, _strip_metadata(cached)
         except json.JSONDecodeError:
             pass
 
@@ -291,25 +378,36 @@ def _caption_clip(task: Tuple[str, Dict], caption_ckpt_folder) -> Tuple[str, dic
 
     # Initialize client within process
     client = _get_openai_client()
-    tries = 3
+    tries = MAX_API_RETRIES
     while tries:
         tries -= 1
         try:
-            response = client.chat.completions.create(
-                model=GPT4O_MODEL_NAME,
-                messages=messages,
-                max_tokens=1000,
-                temperature=0.2,
-                response_format={"type": "json_object"}
-            )
+            kwargs = {
+                "model": GPT4O_MODEL_NAME,
+                "messages": messages,
+                "max_tokens": 1200,
+                "temperature": 0.2,
+            }
+            try:
+                response = create_chat_completion(client, **kwargs, response_format={"type": "json_object"})
+            except Exception as format_error:
+                if "response_format" not in str(format_error):
+                    raise
+                response = create_chat_completion(client, **kwargs)
             resp_str = response.choices[0].message.content
-            parsed = json.loads(resp_str)
-            with open(ckpt_path, "w") as f:
-                json.dump(parsed, f, indent=4)
+            parsed = robust_json_parse(resp_str)
+            if not parsed:
+                raise ValueError(f"Invalid JSON response: {resp_str[:200]}")
+            with open(ckpt_path, "w", encoding="utf-8") as f:
+                ckpt_payload = dict(parsed)
+                ckpt_payload["_admir_metadata"] = _run_metadata()
+                json.dump(ckpt_payload, f, indent=4, ensure_ascii=False)
             return timestamp, parsed
         except Exception as e:
             if tries == 0:
                 print(f"Failed to process {timestamp} after retries: {e}")
+                if _strict_mode():
+                    raise
     return timestamp, {}
 
 def merge_subject_registries(registries: List[dict]) -> dict:
@@ -321,16 +419,23 @@ def merge_subject_registries(registries: List[dict]) -> dict:
     ]
     client = _get_openai_client()
     try:
-        response = client.chat.completions.create(
-            model=GPT4O_MODEL_NAME,
-            messages=messages,
-            max_tokens=2000,
-            temperature=0.2,
-            response_format={"type": "json_object"}
-        )
-        return json.loads(response.choices[0].message.content)
+        kwargs = {
+            "model": GPT4O_MODEL_NAME,
+            "messages": messages,
+            "max_tokens": 2000,
+            "temperature": 0.2,
+        }
+        try:
+            response = create_chat_completion(client, **kwargs, response_format={"type": "json_object"})
+        except Exception as format_error:
+            if "response_format" not in str(format_error):
+                raise
+            response = create_chat_completion(client, **kwargs)
+        return robust_json_parse(response.choices[0].message.content) or {}
     except Exception as e:
         print(f"Error merging registries: {e}")
+        if _strict_mode():
+            raise
         return {}
 
 # --------------------------------------------------------------------------- #
@@ -341,7 +446,9 @@ def process_single_video_pipeline(
     video_path: str,
     output_root: str,
     workers: int,
-    emb_dim: int
+    emb_dim: int,
+    fps: float = None,
+    clip_secs: int = None,
 ):
     video_id = os.path.splitext(os.path.basename(video_path))[0]
     
@@ -354,15 +461,28 @@ def process_single_video_pipeline(
     
     os.makedirs(caption_ckpt_folder, exist_ok=True)
     os.makedirs(frames_dir, exist_ok=True)
+    fps = float(fps if fps is not None else getattr(config, 'VIDEO_FPS', 1))
+    clip_secs = int(clip_secs if clip_secs is not None else getattr(config, 'CLIP_SECS', 5))
 
     print(f"\n[{video_id}] Processing...")
+    _validate_strict_ready()
 
     # Step 1: Decode
-    decode_video_to_frames(video_path, frames_dir, fps=1.0)
+    decode_video_to_frames(video_path, frames_dir, fps=fps)
 
     # Step 2: Generate Captions
-    if not os.path.exists(caption_file_path):
-        clips = gather_clip_frames(frames_dir, getattr(config, 'CLIP_SECS', 30))
+    if os.path.exists(caption_file_path):
+        with open(caption_file_path, "r", encoding="utf-8") as f:
+            existing_captions = json.load(f)
+        existing_metadata = existing_captions.get("_admir_metadata", {})
+        if _strict_mode() and not _metadata_matches_current_run(existing_metadata, fps, clip_secs):
+            raise RuntimeError(
+                f"[{video_id}] Existing captions do not match paper-strict metadata. "
+                "Use a clean output_root for a strict rerun."
+            )
+        print(f"[{video_id}] Captions already exist, metadata matches current run.")
+    else:
+        clips = gather_clip_frames(frames_dir, clip_secs, fps=fps)
         if not clips:
             print(f"[{video_id}] No frames found!")
             return
@@ -386,12 +506,11 @@ def process_single_video_pipeline(
         print(f"[{video_id}] Merging entities...")
         merged_registry = merge_subject_registries(partial_registries)
         frame_captions["subject_registry"] = merged_registry
+        frame_captions["_admir_metadata"] = _run_metadata(video_id, fps, clip_secs)
 
         with open(caption_file_path, "w", encoding="utf-8") as f:
             json.dump(frame_captions, f, indent=4, ensure_ascii=False)
         print(f"[{video_id}] Captions saved.")
-    else:
-        print(f"[{video_id}] Captions already exist, skipping generation.")
 
     # Step 3: Build Database
     print(f"[{video_id}] Building database.json (Embedding)...")
@@ -411,25 +530,36 @@ def main():
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--emb_dim", type=int, default=0)
     parser.add_argument("--emb_endpoint", type=str, default="http://localhost:8090")
+    parser.add_argument("--fps", type=float, default=getattr(config, 'VIDEO_FPS', 1))
+    parser.add_argument("--clip_secs", type=int, default=getattr(config, 'CLIP_SECS', 5))
+    parser.add_argument("--max_videos", type=int, default=0, help="Debug/sample mode: process at most this many videos")
     
     args = parser.parse_args()
 
     global GPT4O_API_KEY, GPT4O_BASE_URL
-    if args.api_key: GPT4O_API_KEY = args.api_key
-    if args.api_url: GPT4O_BASE_URL = args.api_url
+    if args.api_key:
+        GPT4O_API_KEY = args.api_key
+        setattr(config, "OPENAI_API_KEY", args.api_key)
+    if args.api_url:
+        GPT4O_BASE_URL = args.api_url
+        setattr(config, "OPENAI_BASE_URL", args.api_url)
+        setattr(config, "LOCAL_VLLM_BASE_URL", args.api_url)
 
     emb_dim = _get_emb_dim(args.emb_dim, args.emb_endpoint)
     print(f"Target Embedding Dimension: {emb_dim}")
 
     if os.path.isfile(args.video_path):
-        process_single_video_pipeline(args.video_path, args.output_root, args.workers, emb_dim)
+        process_single_video_pipeline(args.video_path, args.output_root, args.workers, emb_dim, args.fps, args.clip_secs)
     elif os.path.isdir(args.video_path):
         video_exts = ('.mp4', '.avi', '.mov', '.mkv', '.webm')
         video_files = [os.path.join(args.video_path, f) for f in os.listdir(args.video_path) if f.lower().endswith(video_exts)]
+        video_files = sorted(video_files)
+        if args.max_videos and args.max_videos > 0:
+            video_files = video_files[:args.max_videos]
         print(f"Found {len(video_files)} videos.")
         for vid in video_files:
             try:
-                process_single_video_pipeline(vid, args.output_root, args.workers, emb_dim)
+                process_single_video_pipeline(vid, args.output_root, args.workers, emb_dim, args.fps, args.clip_secs)
             except Exception as e:
                 print(f"Error processing {vid}: {e}")
                 traceback.print_exc()

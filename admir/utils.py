@@ -14,7 +14,10 @@ import time
 from mimetypes import guess_type
 from typing import Optional, List, Dict, Any, Union
 
-import cv2
+try:
+    import cv2
+except ImportError:
+    cv2 = None
 import requests
 import httpx
 from openai import OpenAI
@@ -139,16 +142,22 @@ def _get_hf_embedder():
         _HF_EMBED_LOCK = threading.Lock()
     with _HF_EMBED_LOCK:
         if _HF_EMBED_MODEL is None:
-            import torch
-            from sentence_transformers import SentenceTransformer
-            
-            # Use path from config or default local path
-            default_local = "./model_zoo/bge-m3"
-            model_path = getattr(config, "HF_EMBEDDING_MODEL_NAME", None) or default_local
-            
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            print(f"Loading local embedding model: {model_path} on {device}")
-            _HF_EMBED_MODEL = SentenceTransformer(model_path, device=device)
+            model_path = getattr(config, "HF_EMBEDDING_MODEL_NAME", None)
+            if not model_path:
+                raise RuntimeError(
+                    "Set ADMIR_HF_EMBEDDING_MODEL to a local path or HuggingFace "
+                    "model id before using ADMIR_EMBEDDING_BACKEND=hf."
+                )
+
+            print(f"Loading local embedding model via FlagEmbedding: {model_path}")
+            try:
+                from FlagEmbedding import BGEM3FlagModel
+            except Exception as exc:
+                raise RuntimeError(
+                    "ADMIR_EMBEDDING_BACKEND=hf requires FlagEmbedding.BGEM3FlagModel."
+                ) from exc
+
+            _HF_EMBED_MODEL = BGEM3FlagModel(model_path, use_fp16=False)
     return _HF_EMBED_MODEL
 
 
@@ -189,16 +198,22 @@ class AzureOpenAIEmbeddingService:
         if not valid_texts:
             return []
 
-        # 1. Local HF Embedding Backend
+        # 1. Local HF Embedding Backend.
         backend = getattr(config, "EMBEDDING_BACKEND", "hf")
+        if backend == "hash":
+            raise RuntimeError("ADMIR_EMBEDDING_BACKEND=hash is disabled; use hf or openai.")
+
         if backend == "hf":
-            model = _get_hf_embedder()
-            vecs = model.encode(
+            embedder = _get_hf_embedder()
+            encoded = embedder.encode(
                 valid_texts,
                 batch_size=int(getattr(config, "HF_EMBEDDING_BATCH_SIZE", 8)),
-                show_progress_bar=False,
-                normalize_embeddings=True,
+                max_length=8192,
+                return_dense=True,
+                return_sparse=False,
+                return_colbert_vecs=False,
             )
+            vecs = encoded["dense_vecs"]
             
             # Remap to original list structure (fill empty strings with zeros or skip)
             results = []
@@ -217,7 +232,11 @@ class AzureOpenAIEmbeddingService:
         # 2. Remote OpenAI-Compatible Backend
         # Initialize Client
         # Use the first endpoint in the list (simplified logic) or env var
-        base_url = endpoints[0] if endpoints else os.environ.get("ADMIR_EMBEDDING_URL", "http://0.0.0.0:8090")
+        base_url = endpoints[0] if endpoints else os.environ.get("ADMIR_EMBEDDING_URL", "")
+        if not base_url:
+            raise RuntimeError(
+                "Set ADMIR_EMBEDDING_ENDPOINT for remote embeddings, or use ADMIR_EMBEDDING_BACKEND=hf."
+            )
         
         # Ensure URL is clean
         base_url = base_url.rstrip("/")
@@ -226,7 +245,7 @@ class AzureOpenAIEmbeddingService:
 
         client = OpenAI(
             base_url=base_url,
-            api_key=api_key or "sk-dummy", # Some local servers need a dummy key
+            api_key=api_key or os.environ.get("OPENAI_API_KEY", ""),
             http_client=httpx.Client(timeout=120.0)
         )
 
@@ -252,6 +271,26 @@ class AzureOpenAIEmbeddingService:
             
         except Exception as e:
             raise RuntimeError(f"Embedding service failed: {e}")
+
+
+def create_chat_completion(
+    client,
+    model: str,
+    messages: List[Dict[str, Any]],
+    max_tokens: Optional[int] = None,
+    temperature: Optional[float] = None,
+    **kwargs,
+):
+    """Create a chat completion with o-series compatible token arguments."""
+    params = dict(kwargs)
+    if max_tokens is not None:
+        if str(model).startswith("o"):
+            params["max_completion_tokens"] = max_tokens
+        else:
+            params["max_tokens"] = max_tokens
+    if temperature is not None and not str(model).startswith("o"):
+        params["temperature"] = temperature
+    return client.chat.completions.create(model=model, messages=messages, **params)
 
 # =====================================================================
 # Utility Functions

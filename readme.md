@@ -1,118 +1,180 @@
-# Admir
+# AD-MIR
 
-This repository contains the official implementation for the paper: **AD-MIR: Bridging the Gap from Perception to Persuasion in Advertising Video Understanding via Structured Reasoning**.
+**AD-MIR: Bridging the Gap from Perception to Persuasion in Advertising Video Understanding via Structured Reasoning**
 
-Admir is a ReAct-based video agent that leverages hybrid retrieval, context-anchored subject registries, and audio-visual fusion to solve complex video question answering tasks.
+<p align="center">
+  <img src="assets/admir-mascot.png" alt="AD-MIR mascot" width="320">
+</p>
 
-## 1. Requirements
+AD-MIR is a tool-grounded video reasoning framework for advertising understanding. It builds a structured multimodal memory from ad videos, routes questions through a ReAct-style controller, invokes an advertising communication expert, and verifies concrete visual/OCR/ASR anchors before producing a concise answer.
 
-### Environment Setup
+This repository is the public, provider-neutral implementation. It does **not** include private API keys, local server paths, model weights, AdsQA videos, or generated evaluation outputs.
 
-We recommend using Conda to manage the environment:
+## What Is Inside
 
-```setup
-conda env create -f conda.yml
+- `admir/agent.py`: ReAct controller, fixed communication-expert initializer, evidence verification, and answer refinement.
+- `admir/build_database.py`: global browse, clip search, frame inspection, subject registry activation, and vector database construction.
+- `prepare_captions.py`: video decoding, clip captioning, subject registry construction, and database initialization.
+- `add_asr_ocr.py`: timestamped ASR augmentation and optional offline OCR utility.
+- `scripts/`: AdsQA download helpers, batch runners, direct VLM baseline runner, preflight checks, and official-prompt judge.
+
+## Installation
+
+```bash
+conda env create -f admir.yml
 conda activate admir
 pip install -r admir_requirements.txt
 ```
 
-### Key Dependencies
-* **Python**: 3.11.14
-* **NanoVectorDB**: For lightweight vector storage.
-* **OpenAI**: For LLM and VLM API calls.
-* **Transformers**: For local Whisper ASR models.
-* **Torch**: Required for local embedding/ASR models.
+You also need `ffmpeg` available on your `PATH`.
 
-## 2. Configuration
+## Configure Runtime Models
 
-The system relies on environment variables for configuration to ensure security and flexibility. You can set these in a `.env` file or export them directly.
-
-**Essential Variables:**
+AD-MIR uses OpenAI-compatible chat/completion endpoints and either local or remote embeddings. Model names are intentionally not hard-coded in this release. Copy `.env.example` and fill in your own endpoints and deployments:
 
 ```bash
-# API Keys
-export OPENAI_API_KEY="..."
-
-# Base URLs (if using vLLM or custom endpoints)
-export ADMIR_LOCAL_VLLM_BASE_URL="xxx"
-export ADMIR_EMBEDDING_ENDPOINT="xxx"
-
-# Model Selection
-export ADMIR_HF_EMBEDDING_MODEL="./model_zoo/bge-m3"
-export ADMIR_CAPTION_VLM_MODEL="Qwen2.5-VL-7B-Instruct"
+cp .env.example .env
+source .env
 ```
 
-See `admir/config.py` for a full list of configurable parameters.
+Minimal variables:
 
-## 3. Data Preparation
+```bash
+export OPENAI_API_KEY="<your-api-key-or-empty-for-local>"
+export OPENAI_BASE_URL="<openai-compatible-chat-endpoint>"
 
-Data preparation consists of two steps: Captioning/DB Initialization and ASR/OCR Extraction.
+export ADMIR_DEFAULT_LMM_MODEL="<your-default-lmm-or-vlm>"
+export ADMIR_CAPTION_VLM_MODEL="<your-caption-vlm>"
+export ADMIR_ORCHESTRATOR_LLM_MODEL="<your-controller-llm>"
+export ADMIR_FRAME_INSPECT_MODEL="<your-frame-inspection-vlm>"
+export ADMIR_COMMUNICATION_EXPERT_MODEL="<your-expert-llm-or-vlm>"
+export ADMIR_REFINE_LLM_MODEL="<your-refinement-llm>"
 
-### Directory Structure
-Prepare your raw videos in the following structure:
-
+export ADMIR_EMBEDDING_BACKEND="hf"
+export ADMIR_HF_EMBEDDING_MODEL="<local-or-hub-embedding-model>"
+export ADMIR_HF_EMBEDDING_DIM="1024"
+export ADMIR_ASR_MODEL="<local-or-hub-asr-model>"
 ```
-./data/
-  ├── raw_videos/
-  │   ├── video1.mp4
-  │   ├── video2.mp4
-  │   └── ...
-  ├── video_database/  (Output directory)
+
+Set `ADMIR_STRICT_PAPER_MODE=1` only when you want fail-fast checks that every component model has been explicitly configured.
+
+## Data Layout
+
+Download AdsQA metadata and place videos under the expected root:
+
+```bash
+python scripts/download_adsqa.py --output_root ./data/AdsQA
 ```
 
-### Step 1: Initialize Database & Generate Captions
-This script decodes videos, generates semantic captions using VLMs, and initializes the vector database.
+Expected layout:
+
+```text
+data/
+  AdsQA/
+    raw_videos/
+      <video_id>.mp4
+    testset_question.json
+    testset_groundtruth.json
+```
+
+The full video dataset is not stored in this repository. Follow the AdsQA license and download instructions for the video files.
+
+## Build Multimodal Memory
+
+Generate clip captions, subject registry entries, and the vector database:
 
 ```bash
 python prepare_captions.py \
-  --video_path ./data/raw_videos \
+  --video_path ./data/AdsQA/raw_videos \
   --output_root ./data/video_database \
-  --workers 8
+  --workers 4
 ```
 
-### Step 2: Add ASR and OCR
-Enhance the database with Automatic Speech Recognition (Whisper) and Optical Character Recognition (GPT-4o/VLM).
+Add timestamped ASR. In strict AD-MIR runs, OCR is verified by the frame-inspection tool rather than by offline pre-aggregation, so `--skip_ocr` is recommended:
 
 ```bash
 python add_asr_ocr.py \
   --video_db_root ./data/video_database \
-  --whisper_model ./model_zoo/whisper-base \
-  --ocr_workers 8
+  --raw_video_root ./data/AdsQA/raw_videos \
+  --asr_model "$ADMIR_ASR_MODEL" \
+  --skip_ocr
 ```
 
-## 4. Inference
+## Run AD-MIR
 
-To run the Admir agent on the benchmark:
+Single sample:
+
+```bash
+python scripts/run_one_sample.py \
+  --dataset_root ./data/AdsQA \
+  --output_db_root ./data/video_database \
+  --results_dir ./results/one_sample \
+  --sample_index 0 \
+  --asr_model "$ADMIR_ASR_MODEL" \
+  --skip_ocr
+```
+
+Batch evaluation:
+
+```bash
+python scripts/run_adsqa_batch.py \
+  --dataset_root ./data/AdsQA \
+  --output_db_root ./data/video_database \
+  --results_dir ./results/adsqa_batch \
+  --num_samples 50 \
+  --workers 2 \
+  --asr_model "$ADMIR_ASR_MODEL" \
+  --skip_ocr
+```
+
+Generic inference on your own question JSON:
 
 ```bash
 python inference.py \
   --test_file ./data/testset.json \
   --video_db_root ./data/video_database \
-  --results_dir ./results/exp_admir_v1 \
-  --workers 8
+  --results_dir ./results/custom_run \
+  --workers 4
 ```
 
-**Arguments:**
-* `--test_file`: JSON file containing the questions (Format: `[{"question_id": "...", "video": "...", "question": "..."}]`).
-* `--video_db_root`: Path to the processed video database.
-* `--workers`: Number of concurrent agents to run.
+## Evaluate With The AdsQA Official Prompt
 
-## 5. File Structure
-
+```bash
+python scripts/judge_adsqa_official_prompt.py \
+  --results_path ./results/adsqa_batch/predictions.jsonl \
+  --groundtruth ./data/AdsQA/testset_groundtruth.json \
+  --output_dir ./results/adsqa_batch_judge \
+  --base_url "$OPENAI_BASE_URL" \
+  --api_key "$OPENAI_API_KEY" \
+  --model "$ADMIR_JUDGE_MODEL"
 ```
-.
-├── admir/                  # Core package
-│   ├── agent.py            # AdmirAgent (ReAct implementation)
-│   ├── build_database.py   # Hybrid retrieval & tools implementation
-│   ├── config.py           # Global configuration
-│   ├── func_call_shema.py  # Function calling schemas
-│   └── utils.py            # Helper utilities
-├── add_asr_ocr.py          # Script for adding Audio/Text modalities
-├── prepare_captions.py     # Script for DB init and visual captioning
-├── inference.py            # Main evaluation script
-└── requirements.txt        # Dependencies
+
+The judge script implements the public AdsQA 0/0.5/1 prompt and reports both strict and relaxed accuracy.
+
+## Preflight
+
+```bash
+python scripts/preflight_paper_strict.py \
+  --dataset_root ./data/AdsQA \
+  --raw_video_root ./data/AdsQA/raw_videos \
+  --asr_model "$ADMIR_ASR_MODEL" \
+  --output_json ./results/preflight.json
+```
+
+## Repository Hygiene
+
+The `.gitignore` excludes model weights, datasets, generated video databases, raw videos, logs, caches, and evaluation outputs. Keep only lightweight source code, documentation, examples, and figures in commits.
+
+## Citation
+
+```bibtex
+@inproceedings{admir2026,
+  title     = {AD-MIR: Bridging the Gap from Perception to Persuasion in Advertising Video Understanding via Structured Reasoning},
+  booktitle = {Proceedings of the International Conference on Machine Learning},
+  year      = {2026}
+}
 ```
 
 ## License
 
-This project is licensed under the MIT License.
+This project is released under the MIT License.

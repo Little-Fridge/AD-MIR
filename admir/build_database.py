@@ -13,16 +13,15 @@ from nano_vectordb import NanoVectorDB
 from tqdm import tqdm
 
 import admir.config as config
-from admir.func_call_shema import doc as D
-from admir.utils import AzureOpenAIEmbeddingService
+from admir.func_call_schema import doc as D
+from admir.utils import AzureOpenAIEmbeddingService, create_chat_completion
 
-# Ensure necessary environment variables are set for underlying services
+# Ensure necessary environment variables are set for underlying services.
 if not os.environ.get("OPENAI_BASE_URL"):
     os.environ["OPENAI_BASE_URL"] = config.LOCAL_VLLM_BASE_URL
 
-# Default embedding URL if not set
-if "ADMIR_EMBEDDING_URL" not in os.environ:
-    os.environ["ADMIR_EMBEDDING_URL"] = "http://0.0.0.0:8090"
+if getattr(config, "EMBEDDING_ENDPOINT", "") and "ADMIR_EMBEDDING_URL" not in os.environ:
+    os.environ["ADMIR_EMBEDDING_URL"] = config.EMBEDDING_ENDPOINT
 
 # =====================================================================
 # Safety Limits
@@ -31,6 +30,11 @@ MAX_TOOL_OUTPUT_CHARS = 20000
 MAX_SUBJECT_REGISTRY_CHARS = 1500
 MAX_CAPTION_CHARS = 2000
 MAX_VLM_RESPONSE_CHARS = 10000
+
+def _require_strict_api_ready() -> None:
+    validate = getattr(config, "validate_strict_paper_config", None)
+    if callable(validate):
+        validate(require_api_key=True)
 
 def _truncate_output(text: str, max_length: int, label: str = "") -> str:
     """Safely truncate text to max length."""
@@ -50,6 +54,8 @@ def _truncate_subject_registry(sr: dict, max_chars: int = MAX_SUBJECT_REGISTRY_C
     # Retain summary of first 5 subjects
     truncated_sr = {}
     for i, (k, v) in enumerate(sr.items()):
+        if i >= 5:
+            break
         if isinstance(v, dict):
             truncated_sr[k] = {
                 "name": v.get("name", "")[:100],
@@ -91,8 +97,22 @@ def _keyword_match_score(keywords: List[str], text: str) -> float:
     matches = sum(1 for kw in keywords if kw in text_lower)
     return matches / len(keywords)
 
-def _merge_continuous_clips(clips: List[Tuple], threshold: float = 3.0) -> List[Tuple]:
-    """Merge continuous or nearby video clips."""
+def _clip_semantic_affinity(a: Tuple, b: Tuple) -> float:
+    try:
+        va = np.array(a[4].get("__vector__", []), dtype=float)
+        vb = np.array(b[4].get("__vector__", []), dtype=float)
+        denom = float(np.linalg.norm(va) * np.linalg.norm(vb))
+        return float(np.dot(va, vb) / denom) if denom else 0.0
+    except Exception:
+        return 0.0
+
+
+def _merge_continuous_clips(
+    clips: List[Tuple],
+    threshold: float = 3.0,
+    semantic_threshold: float = 0.8,
+) -> List[Tuple]:
+    """Merge clips with small temporal gaps or high semantic affinity."""
     if not clips:
         return []
     
@@ -102,7 +122,9 @@ def _merge_continuous_clips(clips: List[Tuple], threshold: float = 3.0) -> List[
     current = list(sorted_clips[0])  # [start, end, caption, score, data]
     
     for clip in sorted_clips[1:]:
-        if clip[0] <= current[1] + threshold:
+        gap_merge = clip[0] <= current[1] + threshold
+        semantic_merge = _clip_semantic_affinity(tuple(current), clip) > semantic_threshold
+        if gap_merge or semantic_merge:
             current[1] = max(current[1], clip[1])
             current[2] = current[2] + "\n" + clip[2]
             current[3] = max(current[3], clip[3])
@@ -167,6 +189,111 @@ def _compute_subject_embeddings(database: NanoVectorDB):
     _SUBJECT_EMBEDDINGS_CACHE[cache_key] = subject_embeddings
     return subject_embeddings
 
+def _safe_cosine(a: np.ndarray, b: np.ndarray) -> float:
+    denom = float(np.linalg.norm(a) * np.linalg.norm(b))
+    if denom == 0:
+        return 0.0
+    return float(np.dot(a, b) / denom)
+
+def get_active_subject_registry(
+    database: NanoVectorDB,
+    query: str,
+    global_context: str = "",
+    top_k: int = 3,
+) -> Dict:
+    """Activate the subject registry with Q + global narrative as the semantic anchor."""
+    additional_data = database.get_additional_data()
+    subject_registry = additional_data.get("subject_registry", {})
+    if not subject_registry or not isinstance(subject_registry, dict):
+        return {}
+
+    subject_embeddings = _compute_subject_embeddings(database)
+    if not subject_embeddings:
+        return _truncate_subject_registry(subject_registry)
+
+    anchor = f"{query or ''}\n{global_context or ''}".strip()
+    if not anchor:
+        return _truncate_subject_registry(subject_registry)
+
+    try:
+        anchor_emb = AzureOpenAIEmbeddingService.get_embeddings(
+            endpoints=config.AOAI_EMBEDDING_RESOURCE_LIST,
+            model_name=config.AOAI_EMBEDDING_LARGE_MODEL_NAME,
+            input_text=[anchor],
+            api_key=config.OPENAI_API_KEY,
+        )[0]["embedding"]
+    except Exception as e:
+        print(f"[WARN] Subject activation failed: {e}")
+        return _truncate_subject_registry(subject_registry)
+
+    anchor_vec = np.array(anchor_emb)
+    ranked = []
+    for subject_id, subject_vec in subject_embeddings.items():
+        ranked.append((subject_id, _safe_cosine(np.array(subject_vec), anchor_vec)))
+    ranked.sort(key=lambda x: x[1], reverse=True)
+
+    active = {}
+    for subject_id, score in ranked[:max(1, top_k)]:
+        if subject_id in subject_registry:
+            active[subject_id] = dict(subject_registry[subject_id])
+        active[subject_id]["activation_score"] = round(score, 4)
+    return active
+
+
+def _caption_text_evidence(database: NanoVectorDB) -> str:
+    """Collect explicit text snippets that captioning already saw."""
+    snippets = []
+    text_markers = ("text", "logo", "tagline", "slogan", "reads", "overlaid", "deliver in")
+    for item in getattr(database, "_data", []):
+        caption = str(item.get("caption", ""))
+        if not caption or not any(marker in caption.lower() for marker in text_markers):
+            continue
+        snippets.extend(re.findall(r"['\"]([^'\"]{3,140})['\"]", caption))
+        snippets.extend(re.findall(r"\b(?:WE\s+)?DELIVER(?:ED)?\s+IN\s+\d+\s+MINUTES\b", caption, flags=re.I))
+
+    unique = []
+    seen = set()
+    for snippet in snippets:
+        normalized = " ".join(str(snippet).split())
+        key = normalized.lower()
+        if normalized and key not in seen:
+            seen.add(key)
+            unique.append(normalized)
+    return " | ".join(unique[:12])
+
+
+def _delivery_minute_evidence(text: str) -> list[tuple[str, str]]:
+    pattern = re.compile(r"\b(?:we\s+)?deliver(?:ed)?\s+in\s+(\d+)\s+minutes?\b", re.I)
+    return [(m.group(0), m.group(1)) for m in pattern.finditer(text or "")]
+
+
+def _repair_ocr_text_with_caption_evidence(ocr_text: str, caption_text: str) -> str:
+    """Surface OCR/caption conflicts instead of silently passing bad exact text."""
+    if not ocr_text or not caption_text:
+        return ocr_text
+
+    ocr_minutes = _delivery_minute_evidence(ocr_text)
+    caption_minutes = _delivery_minute_evidence(caption_text)
+    if not ocr_minutes or not caption_minutes:
+        return ocr_text
+
+    ocr_numbers = {number for _, number in ocr_minutes}
+    caption_numbers = {number for _, number in caption_minutes}
+    if ocr_numbers == caption_numbers:
+        return ocr_text
+
+    caption_phrase = caption_minutes[0][0].upper()
+    ocr_phrase = ocr_minutes[0][0].upper()
+    warning = (
+        "TEXT_CONFLICT_WARNING: OCR read "
+        f"'{ocr_phrase}', while caption/log evidence reads '{caption_phrase}'. "
+        "Use frame inspection or explicit visual evidence for exact numbers."
+    )
+    if warning in ocr_text:
+        return ocr_text
+    return f"{ocr_text} | CAPTION_TEXT_EVIDENCE: {caption_text} | {warning}"
+
+
 def _get_multimodal_context(database: NanoVectorDB) -> Dict[str, str]:
     """Extract ASR context and metadata from the database."""
     additional_data = database.get_additional_data()
@@ -174,6 +301,8 @@ def _get_multimodal_context(database: NanoVectorDB) -> Dict[str, str]:
     context = {
         'asr': '',
         'asr_formatted': 'No audio transcript available.',
+        'ocr': '',
+        'ocr_formatted': '',
         'subject_registry': ''
     }
     
@@ -201,10 +330,22 @@ def _get_multimodal_context(database: NanoVectorDB) -> Dict[str, str]:
     
     if asr_text:
         context['asr'] = asr_text
-        if len(asr_text) > 800:
-            context['asr_formatted'] = asr_text[:400] + "\n...[middle section skipped]...\n" + asr_text[-300:]
-        else:
-            context['asr_formatted'] = asr_text
+        context['asr_formatted'] = asr_text
+
+    ocr_candidates = [
+        additional_data.get('ocr_text'),
+        additional_data.get('ocr_content'),
+        additional_data.get('text_transcript')
+    ]
+    for candidate in ocr_candidates:
+        if candidate:
+            ocr_text = candidate if isinstance(candidate, str) else json.dumps(candidate, ensure_ascii=False)
+            ocr_text = ocr_text.strip()
+            if ocr_text:
+                ocr_text = _repair_ocr_text_with_caption_evidence(ocr_text, _caption_text_evidence(database))
+                context['ocr'] = ocr_text
+                context['ocr_formatted'] = ocr_text
+                break
     
     # 2. Subject Registry extraction
     if 'subject_registry' in additional_data:
@@ -238,11 +379,13 @@ def frame_inspect_tool(
 ) -> str:
     """Inspect video frames with Dynamic Sampling + Batch Processing."""
     assert isinstance(database, NanoVectorDB), "Database must be an instance of NanoVectorDB"
+    _require_strict_api_ready()
     from openai import OpenAI
     import httpx
 
     video_meta = database.get_additional_data()
     video_file_root = video_meta["video_file_root"]
+    fps = float(video_meta.get("fps", getattr(config, "VIDEO_FPS", 1)) or 1)
     
     frames_dir = os.path.join(video_file_root, "frames")
     all_frame_paths = sorted(glob.glob(os.path.join(frames_dir, "frame_n*.jpg")))
@@ -276,7 +419,7 @@ def frame_inspect_tool(
             if len(parts) == 3: secs = float(parts[0])*3600 + float(parts[1])*60 + float(parts[2])
             elif len(parts) == 2: secs = float(parts[0])*60 + float(parts[1])
             else: secs = float(ts)
-            return int(secs)
+            return int(round(secs * fps))
 
         raw_indices = set()
         for tr in time_ranges_hhmmss:
@@ -300,6 +443,9 @@ def frame_inspect_tool(
 
     mm_context = _get_multimodal_context(database)
     asr_context = mm_context.get('asr_formatted', '')
+    ocr_context = mm_context.get('ocr_formatted', '')
+    active_subjects = get_active_subject_registry(database, question, top_k=3)
+    active_subjects_text = json.dumps(active_subjects, ensure_ascii=False) if active_subjects else "None"
     
     base_instructions = ""
     if analysis_mode == 'literal':
@@ -336,6 +482,8 @@ def frame_inspect_tool(
         batch_prompt = (
             f"{base_instructions}\n"
             f"Context (ASR): '{asr_context[:600]}...'\n"
+            f"Context (OCR/Text): '{ocr_context[:600]}...'\n"
+            f"Active subject registry: {active_subjects_text[:1200]}\n"
             f"User Question: {question}\n"
             f"--- BATCH INSTRUCTION ---\n"
             f"Part {i+1} of {len(chunks)}.\n"
@@ -361,10 +509,11 @@ def frame_inspect_tool(
             continue
 
         try:
-            response = temp_client.chat.completions.create(
-                model=config.AOAI_TOOL_VLM_MODEL_NAME,
+            response = create_chat_completion(
+                temp_client,
+                model=getattr(config, "AOAI_FRAME_INSPECT_MODEL_NAME", config.AOAI_TOOL_VLM_MODEL_NAME),
                 messages=[{"role": "user", "content": content_list}], 
-                max_tokens=20000, 
+                max_tokens=int(os.environ.get("ADMIR_FRAME_INSPECT_MAX_TOKENS", "20000")), 
                 temperature=0.0
             )
             full_report.append(f"--- [PART {i+1}] ---\n{response.choices[0].message.content}")
@@ -381,12 +530,18 @@ def clip_search_tool(
 ) -> str:
     """Semantic Hybrid Search: LLM Rewrite + Vector Similarity + Keyword Boosting."""
     assert isinstance(database, NanoVectorDB), "Database error"
+    _require_strict_api_ready()
+    top_k = max(
+        int(getattr(config, "CLIP_SEARCH_MIN_TOPK", 5)),
+        min(int(top_k or 5), int(getattr(config, "OVERWRITE_CLIP_SEARCH_TOPK", 8))),
+    )
 
     # [Step 0: Semantic Query Rewrite]
     def _rewrite_query(original_query: str) -> str:
         if len(original_query.split()) < 2 or '"' in original_query:
             return original_query
         try:
+            _require_strict_api_ready()
             from openai import OpenAI
             import httpx
             exp_client = OpenAI(
@@ -396,11 +551,15 @@ def clip_search_tool(
             )
             
             prompt = (
-                f"Rewrite '{original_query}' into 3 simple, comma-separated keywords.\n"
+                f"Rewrite '{original_query}' into 3 simple, comma-separated keywords/phrases for video retrieval.\n"
+                "Rules: Keep it generic. Do NOT invent specific visual details "
+                "(e.g. do NOT change 'luxury' to 'gold').\n"
+                "Input: 'sad man' -> Output: crying person, unhappy face, depressed mood\n"
                 f"Input: '{original_query}'\nOutput:"
             )
-            resp = exp_client.chat.completions.create(
-                model="gpt-4o-mini",
+            resp = create_chat_completion(
+                exp_client,
+                model=config.AOAI_REFINE_LLM_MODEL_NAME,
                 messages=[{"role": "user", "content": prompt}],
                 max_tokens=50,
                 temperature=0.3
@@ -444,7 +603,7 @@ def clip_search_tool(
                 quote_boost += 3.0 
         
         asr_boost = 0.1 if any(k in asr_text_lower for k in keywords) else 0.0
-        final_score = base_score + (cap_match_ratio * 2.0) + quote_boost + asr_boost
+        final_score = base_score + (cap_match_ratio * config.LEXICAL_MATCH_BETA) + quote_boost + asr_boost
         
         scored_clips.append((data['time_start_secs'], data['time_end_secs'], data['caption'], final_score, data))
     
@@ -452,7 +611,7 @@ def clip_search_tool(
     scored_clips.sort(key=lambda x: x[3], reverse=True)
     top_clips = scored_clips[:top_k]
     top_clips.sort(key=lambda x: x[0])
-    merged_clips = _merge_continuous_clips(top_clips, threshold=3.0)
+    merged_clips = _merge_continuous_clips(top_clips, threshold=3.0, semantic_threshold=0.8)
     
     def _sec_to_hhmmss(s: float) -> str:
         return f"{int(s//3600):02d}:{int((s%3600)//60):02d}:{int(s%60):02d}"
@@ -469,8 +628,9 @@ def global_browse_tool(
 ) -> str:
     """Text-Based Forensic Reconstruction using Captions + ASR."""
     assert isinstance(database, NanoVectorDB), "Database error"
+    _require_strict_api_ready()
     
-    SWEEP_K = 1000  
+    SWEEP_K = max(int(getattr(config, "GLOBAL_BROWSE_TOPK", 40)) * 4, 40)
     MAX_CONTEXT_CHARS = 40000 
     
     try:
@@ -488,6 +648,19 @@ def global_browse_tool(
         return json.dumps({"error": "No captions found in database."})
 
     candidates.sort(key=lambda x: x['time_start_secs'])
+    browse_topk = int(getattr(config, "GLOBAL_BROWSE_TOPK", 40))
+    if len(candidates) > browse_topk:
+        boundary = max(1, min(5, browse_topk // 4))
+        start_items = candidates[:boundary]
+        end_items = candidates[-boundary:]
+        middle = candidates[boundary:-boundary]
+        remaining = browse_topk - len(start_items) - len(end_items)
+        if remaining > 0 and middle:
+            middle_indices = np.linspace(0, len(middle) - 1, remaining, dtype=int)
+            middle_items = [middle[i] for i in middle_indices]
+        else:
+            middle_items = []
+        candidates = sorted(start_items + middle_items + end_items, key=lambda x: x['time_start_secs'])
     
     log_entries = []
     for item in candidates:
@@ -503,18 +676,35 @@ def global_browse_tool(
     visual_log = "\n".join(log_entries)
     mm_context = _get_multimodal_context(database)
     asr_transcript = mm_context.get('asr_formatted') or mm_context.get('asr', 'No audio transcript provided.')
+    ocr_transcript = mm_context.get('ocr_formatted') or mm_context.get('ocr', 'No OCR text provided.')
+    active_subjects = get_active_subject_registry(database, query, global_context=visual_log, top_k=3)
+    active_subjects_text = json.dumps(active_subjects, ensure_ascii=False) if active_subjects else "None"
 
-    system_prompt = """You are a Media Forensics Expert.
-**YOUR CONSTRAINT**: You cannot see the video. You only have text logs and audio transcripts.
+    system_prompt = """You are a Media Forensics Expert specialized in solving AdsQA cases.
+**YOUR CONSTRAINT**: You cannot see the video. You only have:
+1. Visual logs from clip captions.
+2. Audio transcript.
+3. OCR/text clues and active subject registry.
+**STRATEGY FOR TEXT-ONLY ANALYSIS**:
+1. Cross-reference visual and audio clues to infer product, brand, action, and intent.
+2. Look specifically for [POTENTIAL_TEXT] tags and OCR clues.
+3. Use active subjects to resolve pronouns and suppress background noise.
 **OUTPUT FORMAT (JSON)**:
 {
-  "narrative_reconstruction": "Story flow",
+  "narrative_reconstruction": "Story flow (Hook -> Middle -> End).",
   "inferred_objects": ["List of objects"],
   "explicit_text_found": ["Text quoted in logs"],
+  "audio_visual_mismatch": "Contradictions between seen and heard?",
   "final_answer": "Direct answer to USER QUERY."
 }
 """
-    user_content = f"QUERY: {query}\nAUDIO: {asr_transcript}\nLOGS: {visual_log[:MAX_CONTEXT_CHARS]}"
+    user_content = (
+        f"QUERY: {query}\n"
+        f"AUDIO: {asr_transcript}\n"
+        f"OCR/TEXT: {ocr_transcript}\n"
+        f"ACTIVE SUBJECTS: {active_subjects_text}\n"
+        f"LOGS: {visual_log[:MAX_CONTEXT_CHARS]}"
+    )
 
     try:
         from openai import OpenAI
@@ -524,8 +714,9 @@ def global_browse_tool(
             api_key=config.OPENAI_API_KEY, 
             http_client=httpx.Client(timeout=300.0)
         )
-        response = temp_client.chat.completions.create(
-            model="gpt-4o", 
+        response = create_chat_completion(
+            temp_client,
+            model=config.AOAI_ORCHESTRATOR_LLM_MODEL_NAME, 
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_content}
@@ -555,6 +746,16 @@ def init_single_video_db(video_caption_json_path, output_video_db_path, emb_dim)
     vdb = NanoVectorDB(emb_dim, storage_file=output_video_db_path)
     if os.path.exists(output_video_db_path):
         print(f"Database {output_video_db_path} already exists.")
+        if getattr(config, "STRICT_PAPER_MODE", False):
+            with open(video_caption_json_path, "r", encoding="utf-8") as f:
+                captions = json.load(f)
+            expected_metadata = captions.get("_admir_metadata", {})
+            actual_metadata = vdb.get_additional_data().get("caption_metadata", {})
+            if actual_metadata != expected_metadata:
+                raise RuntimeError(
+                    f"Existing database {output_video_db_path} does not match "
+                    "paper-strict caption metadata. Use a clean output root."
+                )
     else:
         cap2emb_list = preprocess_captions(video_caption_json_path)
         data = []
@@ -571,30 +772,38 @@ def init_single_video_db(video_caption_json_path, output_video_db_path, emb_dim)
                 }
             )
         _ = vdb.upsert(data)
-        with open(video_caption_json_path, "r") as f:
+        with open(video_caption_json_path, "r", encoding="utf-8") as f:
             captions = json.load(f)
-        subject_registry = captions.pop('subject_registry', captions.pop('character_registry', None))          
-        video_length = max([float(k.split("_")[1]) for k in captions.keys()])
+        caption_metadata = captions.get('_admir_metadata', {})
+        subject_registry = captions.get('subject_registry', captions.get('character_registry', None))
+        clip_keys = [k for k in captions.keys() if re.match(r"^\d+(\.\d+)?_\d+(\.\d+)?$", str(k))]
+        video_length = max([float(k.split("_")[1]) for k in clip_keys]) if clip_keys else 0
         video_length_str = convert_seconds_to_hhmmss(video_length)
         additional_data = {
             'subject_registry': subject_registry,
             'video_length': video_length_str,
             'video_file_root': os.path.dirname(os.path.dirname(video_caption_json_path)),
             'fps': getattr(config, "VIDEO_FPS", 2),
+            'caption_metadata': caption_metadata,
         }
         vdb.store_additional_data(**additional_data)
         vdb.save()
     return vdb
 
 def preprocess_captions(caption_json_path):
-    with open(caption_json_path, "r") as f:
+    with open(caption_json_path, "r", encoding="utf-8") as f:
         captions = json.load(f)
         
     scripts = []
     captions.pop('subject_registry', None)
     captions.pop('character_registry', None)
+    captions.pop('_admir_metadata', None)
     
     for idx, (timestamp, cap_info) in enumerate(captions.items()):
+        if not re.match(r"^\d+(\.\d+)?_\d+(\.\d+)?$", str(timestamp)):
+            continue
+        if isinstance(cap_info, str):
+            cap_info = {"caption": cap_info}
         if cap_info.get('caption') is None or len(cap_info['caption']) == 0:
             continue
         elif isinstance(cap_info['caption'], list):

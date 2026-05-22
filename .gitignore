@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+
+# Datasets, model weights, and generated artifacts
+data/
+raw_videos/
+video_database/
+model_zoo/
+models/
+checkpoints/
+results/
+logs/
+runs/
+outputs/
+tmp/
+*.log
+
+# Large media and archives
+*.mp4
+*.mov
+*.mkv
+*.webm
+*.avi
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+
+# OS/editor
+.DS_Store
+.idea/
+.vscode/

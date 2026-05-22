@@ -15,15 +15,16 @@ import tempfile
 from typing import List, Optional, Tuple
 
 sys.path.append(os.getcwd())
+import admir.config as config
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # Configuration via Environment Variables
-GPT4O_BASE_URL = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
-GPT4O_API_KEY = os.environ.get("OPENAI_API_KEY", "")
-GPT4O_MODEL_NAME = "gpt-4o"
-WHISPER_MODEL_ID = "./model_zoo/whisper-base" 
+GPT4O_BASE_URL = os.environ.get("OPENAI_BASE_URL", config.LOCAL_VLLM_BASE_URL)
+GPT4O_API_KEY = os.environ.get("OPENAI_API_KEY", config.OPENAI_API_KEY)
+GPT4O_MODEL_NAME = os.environ.get("ADMIR_TOOL_VLM_MODEL", config.AOAI_TOOL_VLM_MODEL_NAME)
+WHISPER_MODEL_ID = os.environ.get("ADMIR_ASR_MODEL", "")
 
 _whisper_pipeline = None
 
@@ -43,20 +44,37 @@ def load_whisper_pipeline(model_id: str = WHISPER_MODEL_ID, device: str = "cuda"
 def extract_audio_from_video(video_path: str) -> Optional[str]:
     output_path = tempfile.mktemp(suffix=".wav")
     try:
-        subprocess.run(
+        proc = subprocess.run(
             ["ffmpeg", "-y", "-i", video_path, "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", output_path],
             capture_output=True, timeout=300
         )
+        if proc.returncode != 0 or not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+            raise RuntimeError(proc.stderr.decode("utf-8", errors="ignore")[-1000:])
         return output_path
     except Exception:
+        if os.path.exists(output_path):
+            os.remove(output_path)
         return None
 
 def extract_asr_whisper_hf(video_path: str, model_id: str, device: str) -> str:
     audio_path = extract_audio_from_video(video_path)
-    if not audio_path: return ""
+    if not audio_path:
+        raise RuntimeError(f"Could not extract audio from {video_path}")
     try:
         pipe = load_whisper_pipeline(model_id, device)
         result = pipe(audio_path, return_timestamps=True, generate_kwargs={"language": None})
+        chunks = result.get("chunks") or []
+        if chunks:
+            lines = []
+            for chunk in chunks:
+                ts = chunk.get("timestamp") or (None, None)
+                start = "" if ts[0] is None else f"{float(ts[0]):.2f}"
+                end = "" if ts[1] is None else f"{float(ts[1]):.2f}"
+                text = str(chunk.get("text", "")).strip()
+                if text:
+                    lines.append(f"[{start}-{end}] {text}")
+            if lines:
+                return "\n".join(lines)
         return result.get("text", "").strip()
     finally:
         if os.path.exists(audio_path): os.remove(audio_path)
@@ -74,7 +92,7 @@ def extract_ocr_gpt4o_single_frame(image_path: str) -> List[str]:
                 "role": "user",
                 "content": [
                     {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
-                    {"type": "text", "text": "Extract ALL visible text."}
+                    {"type": "text", "text": "Extract ALL visible text from this image. Include titles, labels, captions, signs, logos, brand names, slogans, and written content. Return ONLY extracted text, one item per line. If no text is visible, return NO_TEXT."}
                 ]
             }],
             max_tokens=500
@@ -86,7 +104,7 @@ def update_database_with_asr_ocr(video_db_path: str, asr_text: str, ocr_text: st
     try:
         from nano_vectordb import NanoVectorDB
         if not os.path.exists(video_db_path): return False
-        db = NanoVectorDB(1024, storage_file=video_db_path)
+        db = NanoVectorDB(config.AOAI_EMBEDDING_LARGE_DIM, storage_file=video_db_path)
         data = db.get_additional_data()
         data['asr_text'] = asr_text
         data['ocr_text'] = ocr_text
@@ -125,17 +143,45 @@ def scan_video_databases(video_db_root: str) -> List[str]:
             video_ids.append(item)
     return sorted(video_ids)
 
-def process_single_video(video_id, video_db_root, raw_dir, whisper_model, ocr_interval, ocr_workers, skip_existing, device):
+def _find_video_file(raw_dir: str, video_id: str) -> str:
+    for ext in (".mp4", ".webm", ".mkv", ".mov", ".avi"):
+        path = os.path.join(raw_dir, video_id + ext)
+        if os.path.exists(path):
+            return path
+    return ""
+
+def process_single_video(video_id, video_db_root, raw_dir, asr_model, ocr_interval, ocr_workers, skip_existing, device, skip_ocr=False):
     base_dir = os.path.join(video_db_root, video_id)
     video_db_path = os.path.join(base_dir, "database.json")
     frames_dir = os.path.join(base_dir, "frames")
     
     if not os.path.exists(video_db_path): return False, "DB Not Found"
     
-    video_path = os.path.join(raw_dir, video_id + ".mp4") # Simplified check
+    video_path = _find_video_file(raw_dir, video_id)
     
-    asr = extract_asr_whisper_hf(video_path, whisper_model, device) if os.path.exists(video_path) else ""
-    ocr = extract_ocr_gpt4o_batch(frames_dir, ocr_interval, ocr_workers) if os.path.exists(frames_dir) else ""
+    if not video_path or not os.path.exists(video_path):
+        raise FileNotFoundError(f"Raw video missing for {video_id} under {raw_dir}")
+    if not asr_model:
+        raise FileNotFoundError("Set --asr_model or ADMIR_ASR_MODEL before running ASR.")
+    if not (os.path.exists(asr_model) or ("/" in asr_model and not asr_model.startswith("."))):
+        raise FileNotFoundError(f"ASR model not found: {asr_model}")
+    if getattr(config, "STRICT_PAPER_MODE", False) and not skip_ocr:
+        raise RuntimeError("Strict mode leaves OCR to frame_inspect; pass --skip_ocr for ASR-only augmentation.")
+
+    if skip_existing:
+        try:
+            with open(video_db_path, "r", encoding="utf-8") as f:
+                current_db = json.load(f)
+            additional_data = current_db.get("additional_data", {}) if isinstance(current_db, dict) else {}
+            has_asr = "asr_text" in current_db or "asr_text" in additional_data
+            has_ocr = skip_ocr or "ocr_text" in current_db or "ocr_text" in additional_data
+            if has_asr and has_ocr:
+                return True, "Already exists"
+        except Exception:
+            pass
+
+    asr = extract_asr_whisper_hf(video_path, asr_model, device)
+    ocr = "" if skip_ocr else (extract_ocr_gpt4o_batch(frames_dir, ocr_interval, ocr_workers) if os.path.exists(frames_dir) else "")
     
     if update_database_with_asr_ocr(video_db_path, asr, ocr):
         return True, "Updated"
@@ -144,16 +190,19 @@ def process_single_video(video_id, video_db_root, raw_dir, whisper_model, ocr_in
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--video_db_root", type=str, default="./video_database")
-    parser.add_argument("--whisper_model", type=str, default=WHISPER_MODEL_ID)
+    parser.add_argument("--raw_video_root", type=str, default="./data/raw_videos")
+    parser.add_argument("--asr_model", type=str, default=WHISPER_MODEL_ID)
     parser.add_argument("--ocr_sample_interval", type=int, default=15)
     parser.add_argument("--ocr_workers", type=int, default=8)
+    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--skip_ocr", action="store_true", help="Paper-strict runs use Whisper ASR here and leave OCR to frame_inspect.")
     args = parser.parse_args()
     
     video_ids = scan_video_databases(args.video_db_root)
-    raw_dir = os.path.join(args.video_db_root, "raw")
+    raw_dir = args.raw_video_root
     
     for vid in video_ids:
-        process_single_video(vid, args.video_db_root, raw_dir, args.whisper_model, args.ocr_sample_interval, args.ocr_workers, True, "cuda")
+        process_single_video(vid, args.video_db_root, raw_dir, args.asr_model, args.ocr_sample_interval, args.ocr_workers, True, args.device, args.skip_ocr)
 
 if __name__ == "__main__":
     main()
