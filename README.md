@@ -167,10 +167,15 @@ The `.gitignore` excludes model weights, raw videos, generated video databases, 
 ## Citation
 
 ```bibtex
-@inproceedings{admir2026,
-  title     = {AD-MIR: Bridging the Gap from Perception to Persuasion in Advertising Video Understanding via Structured Reasoning},
-  booktitle = {Proceedings of the International Conference on Machine Learning},
-  year      = {2026}
+@article{xu2026admir,
+  title         = {AD-MIR: Bridging the Gap from Perception to Persuasion in Advertising Video Understanding via Structured Reasoning},
+  author        = {Binxiao Xu and Junyu Feng and Xiaopeng Lin and Haodong Li and Zhiyuan Feng and Bohan Zeng and Shaolin Lu and Ming Lu and Qi She and Wentao Zhang},
+  journal       = {arXiv preprint arXiv:2602.07625},
+  year          = {2026},
+  eprint        = {2602.07625},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.CV},
+  url           = {https://arxiv.org/abs/2602.07625}
 }
 ```
 
