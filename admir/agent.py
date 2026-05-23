@@ -609,7 +609,7 @@ class AdmirAgent:
         )
         try:
             compressed = self._call_text_model(
-                "You are compressing an answer for a visual QA benchmark.",
+                "You are compressing an answer for an advertising-video question.",
                 (
                     "Rewrite the answer to be <= 25 words, but DO NOT lose core information.\n"
                     "Preserve names, entities, numbers, colors, attributes, and negation.\n"

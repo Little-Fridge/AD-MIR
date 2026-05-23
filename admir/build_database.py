@@ -680,7 +680,7 @@ def global_browse_tool(
     active_subjects = get_active_subject_registry(database, query, global_context=visual_log, top_k=3)
     active_subjects_text = json.dumps(active_subjects, ensure_ascii=False) if active_subjects else "None"
 
-    system_prompt = """You are a Media Forensics Expert specialized in solving AdsQA cases.
+    system_prompt = """You are a Media Forensics Expert specialized in answering advertising-video questions.
 **YOUR CONSTRAINT**: You cannot see the video. You only have:
 1. Visual logs from clip captions.
 2. Audio transcript.
