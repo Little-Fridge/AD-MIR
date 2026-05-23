@@ -6,9 +6,55 @@
   <img src="assets/admir-mascot.png" alt="AD-MIR mascot" width="320">
 </p>
 
-AD-MIR is a tool-grounded video reasoning framework for advertising understanding. It builds a structured multimodal memory from ad videos, routes questions through a ReAct-style controller, invokes an advertising communication expert, and verifies concrete visual/OCR/ASR anchors before producing a concise answer.
+<p align="center">
+  <em>From pixels to persuasion: AD-MIR turns ad videos into auditable evidence trails.</em>
+</p>
+
+AD-MIR is a tool-grounded video reasoning framework for advertising understanding. Instead of answering from a single pass over frames, it builds structured multimodal memory, retrieves relevant evidence, asks a communication expert to reason about persuasive intent, and verifies concrete visual/OCR/ASR anchors before producing a concise answer.
 
 This repository is the public, provider-neutral implementation. It does **not** include private API keys, local server paths, model weights, AdsQA videos, or generated evaluation outputs.
+
+## Why AD-MIR?
+
+Advertising videos are engineered to imply more than they literally show: product claims appear in tiny text, emotional appeals unfold across edits, and the real answer often depends on connecting a visual object to a persuasion strategy. AD-MIR makes that reasoning explicit.
+
+- **Structured memory:** converts videos into caption, ASR, subject-registry, and retrieval-ready evidence.
+- **Tool-grounded reasoning:** combines global browsing, clip search, frame inspection, and expert interpretation.
+- **Visual-anchor verification:** checks concrete claims against retrieved or inspected evidence before finalizing.
+- **Auditable traces:** records tool calls and observations so answers can be inspected after inference.
+
+## Visual Tour
+
+### Reasoning Workflow
+
+<p align="center">
+  <img src="assets/figure1-workflow.png" alt="AD-MIR reasoning workflow" width="900">
+</p>
+
+AD-MIR first builds browse-based context and a high-level advertising narrative, then zooms into precise clips and frames when the answer depends on literal visual evidence.
+
+### System Architecture
+
+<p align="center">
+  <img src="assets/figure2-architecture.png" alt="AD-MIR architecture" width="900">
+</p>
+
+The system couples a ReAct controller with a shared multimodal database and four interaction tools: Global Browse, Communication Expert, Clip Search, and Frame Inspect.
+
+### Real AdsQA Case Trajectories
+
+<p align="center">
+  <img src="assets/case-gallery.png" alt="AD-MIR qualitative case gallery" width="900">
+</p>
+
+The cases above are real AdsQA examples from the paper. Each card shows retrieved or inspected frames, the question, the ground-truth answer, AD-MIR's answer, and the evidence trace used to support the final response.
+
+<p align="center">
+  <img src="assets/tool-grounding-cases.png" alt="AD-MIR tool grounding cases" width="440">
+  <img src="assets/intent-reasoning-cases.png" alt="AD-MIR intent reasoning cases" width="440">
+</p>
+
+Tool-grounding cases emphasize literal verification, while intent-reasoning cases show how visual evidence and OCR/ASR cues support higher-level advertising interpretation.
 
 ## What Is Inside
 
